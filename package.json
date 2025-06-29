@@ -1,0 +1,82 @@
+{
+  "name": "@crudmates/ludari",
+  "version": "0.0.1",
+  "description": "Modern, flexible cron job manager for Node.js with pluggable storage and caching",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src --ext .ts",
+    "clean": "rimraf dist",
+    "prepublishOnly": "npm run clean && npm run build && npm run test",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "cron",
+    "scheduler",
+    "job",
+    "task",
+    "manager",
+    "distributed",
+    "typescript"
+  ],
+  "author": "CrudMates",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crudmates/ludari.git",
+    "directory": "packages/ludari"
+  },
+  "bugs": {
+    "url": "https://github.com/crudmates/ludari/issues"
+  },
+  "homepage": "https://github.com/crudmates/ludari#readme",
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "cron": "^2.0.0",
+    "crypto-js": "^4.2.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/cron": "^2.0.0",
+    "@types/crypto-js": "^4.2.0",
+    "@types/jest": "^29.0.0",
+    "@types/node": "^18.0.0",
+    "@types/supertest": "^2.0.12",
+    "@types/uuid": "^9.0.0",
+    "@typescript-eslint/eslint-plugin": "^5.0.0",
+    "@typescript-eslint/parser": "^5.0.0",
+    "eslint": "^8.0.0",
+    "jest": "^29.0.0",
+    "rimraf": "^5.0.0",
+    "supertest": "^6.3.3",
+    "ts-jest": "^29.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "ioredis": "^5.0.0",
+    "mongoose": "^7.0.0",
+    "typeorm": "^0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "typeorm": {
+      "optional": true
+    },
+    "mongoose": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    }
+  }
+}

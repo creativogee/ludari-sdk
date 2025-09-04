@@ -141,11 +141,55 @@ export function Bind(): any {
 export abstract class BaseJobHandler implements Handler {
   // No constructor needed - use @Bind() decorator for method binding
 
+  // Internal/forbidden methods that cannot be executed as job methods
+  private static readonly FORBIDDEN_METHODS = [
+    'constructor',
+    'executeMethod',
+    'hasMethod',
+    'getAvailableMethods',
+    '__proto__',
+    'prototype',
+    'apply',
+    'call',
+    'bind',
+  ];
+
   async executeMethod(methodName: string, context: JobContext, lens: Lens): Promise<any> {
+    // Validate method name to prevent code injection
+    if (!methodName || typeof methodName !== 'string') {
+      throw new Error('Method name must be a non-empty string');
+    }
+
+    // Sanitize method name - only allow alphanumeric characters and underscores
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(methodName)) {
+      throw new Error(`Invalid method name: '${methodName}'. Only alphanumeric characters and underscores are allowed.`);
+    }
+
+    // Check if method exists in allowed methods whitelist
+    const availableMethods = this.getAvailableMethods();
+    if (!availableMethods.includes(methodName)) {
+      throw new Error(`Job method '${methodName}' is not in the whitelist of available methods: ${availableMethods.join(', ')}`);
+    }
+
+    // Additional safety check - ensure method exists and is callable
+    if (!this.hasMethod(methodName)) {
+      throw new Error(`Job method '${methodName}' not found on ${this.constructor.name}`);
+    }
+
     const method = (this as any)[methodName];
 
     if (typeof method !== 'function') {
-      throw new Error(`Job method '${methodName}' not found on ${this.constructor.name}`);
+      throw new Error(`'${methodName}' is not a function on ${this.constructor.name}`);
+    }
+
+    // Prevent calling internal/dangerous methods
+    const forbiddenMethods = [
+      'constructor', 'executeMethod', 'hasMethod', 'getAvailableMethods',
+      '__proto__', 'prototype', 'apply', 'call', 'bind'
+    ];
+    
+    if (forbiddenMethods.includes(methodName)) {
+      throw new Error(`Cannot execute forbidden method: '${methodName}'`);
     }
 
     return method.call(this, context, lens);
@@ -157,17 +201,60 @@ export abstract class BaseJobHandler implements Handler {
   }
 
   getAvailableMethods(): string[] {
-    const propertyNames = Object.getOwnPropertyNames(Object.getPrototypeOf(this));
+    // Get methods from both prototype and instance, walking up the prototype chain
+    // This handles cases where @Bind() decorator creates wrapper classes
+    const allPropertyNames = new Set<string>();
+    
+    // Walk up the prototype chain to find all methods
+    let current = this;
+    while (current && current !== Object.prototype && current.constructor !== Object) {
+      // Add instance properties
+      Object.getOwnPropertyNames(current).forEach(name => allPropertyNames.add(name));
+      
+      // Add prototype properties
+      const proto = Object.getPrototypeOf(current);
+      if (proto && proto !== Object.prototype) {
+        Object.getOwnPropertyNames(proto).forEach(name => allPropertyNames.add(name));
+      }
+      
+      current = proto;
+    }
 
-    return propertyNames.filter((name) => {
+    return Array.from(allPropertyNames).filter((name) => {
       const property = (this as any)[name];
-      return (
-        typeof property === 'function' &&
-        name !== 'constructor' &&
-        name !== 'executeMethod' &&
-        name !== 'hasMethod' &&
-        name !== 'getAvailableMethods'
-      );
+
+      // Must be a function
+      if (typeof property !== 'function') {
+        return false;
+      }
+
+      // Exclude internal/forbidden methods
+      if (BaseJobHandler.FORBIDDEN_METHODS.includes(name)) {
+        return false;
+      }
+
+      // Exclude private methods (starting with underscore)
+      if (name.startsWith('_')) {
+        return false;
+      }
+
+      // Exclude methods that are likely private based on naming conventions
+      const privatePatterns = [
+        /^(internal|private|hidden)/i,
+        /Private$/i,
+        /Internal$/i,
+      ];
+      
+      if (privatePatterns.some(pattern => pattern.test(name))) {
+        return false;
+      }
+
+      // Exclude getters/setters
+      if (name.startsWith('get ') || name.startsWith('set ')) {
+        return false;
+      }
+
+      return true;
     });
   }
 }

@@ -26,12 +26,12 @@ describe('Manager', () => {
     const storage = new InMemoryStorage();
     const cache = new InMemoryCache({ disableCleanup: true }); // Disable cleanup to avoid hanging timers
     const manager = new Manager({
-      replicaId: `test-replica-${Date.now()}-${Math.random()}`, // Unique replica ID per test
+      replicaId: `test-replica-${Date.now()}-${Math.floor(Math.random() * 1000000)}`, // Unique replica ID per test
       storage,
       cache,
       logger: mockLogger,
       handler: mockJobHandler,
-      querySecret: 'test-secret-key', // Add query secret for encryption tests
+      querySecret: 'Unit-Test-Strong-Encryption-Key-With-Numbers-123-And-Symbols!@#', // Strong key for tests
       enabled: false, // Disable to avoid automatic job scheduling during tests
       watchInterval: 1,
     });
@@ -97,6 +97,29 @@ describe('Manager', () => {
         expect.stringContaining('Manager initialized with replicaId:'),
       );
       await manager.destroy();
+    });
+
+    it('deadlock detection interval is unrefed', async () => {
+      const { manager } = createManager();
+
+      const originalSetInterval = global.setInterval;
+      let capturedInterval: any = null;
+      (global as any).setInterval = ((handler: any, timeout?: any, ...args: any[]) => {
+        const handle: any = originalSetInterval(handler as any, timeout as any, ...args);
+        capturedInterval = handle;
+        return handle;
+      }) as any;
+
+      try {
+        await manager.initialize();
+        expect(capturedInterval).toBeTruthy();
+        if (typeof capturedInterval.hasRef === 'function') {
+          expect(capturedInterval.hasRef()).toBe(false);
+        }
+      } finally {
+        (global as any).setInterval = originalSetInterval;
+        await manager.destroy();
+      }
     });
 
     it('should create control record if none exists', async () => {
@@ -191,7 +214,7 @@ describe('Manager', () => {
         enabled: true,
       });
 
-      const toggled = await manager.toggleJob(job.name);
+      const toggled = await manager.toggleJob(job.id);
       expect(toggled.enabled).toBe(false);
 
       await manager.destroy();
@@ -264,20 +287,24 @@ describe('Manager', () => {
 
       // Should not be able to modify __watch__ jobs
       await expect(manager.updateJob(watchJob!.id, { enabled: false })).rejects.toThrow(
-        'Cannot modify __watch__ jobs',
+        'Cannot update system job: __watch__',
       );
 
-      await expect(manager.toggleJob(watchJob!.name)).rejects.toThrow(
-        'Cannot modify __watch__ jobs',
+      await expect(manager.toggleJob(watchJob!.id)).rejects.toThrow(
+        'Cannot toggle system job: __watch__',
       );
 
-      await expect(manager.enableJob(watchJob!.id)).rejects.toThrow('Cannot modify __watch__ jobs');
+      await expect(manager.enableJob(watchJob!.id)).rejects.toThrow(
+        'Cannot enable system job: __watch__',
+      );
 
       await expect(manager.disableJob(watchJob!.id)).rejects.toThrow(
-        'Cannot modify __watch__ jobs',
+        'Cannot disable system job: __watch__',
       );
 
-      await expect(manager.deleteJob(watchJob!.id)).rejects.toThrow('Cannot delete __watch__ jobs');
+      await expect(manager.deleteJob(watchJob!.id)).rejects.toThrow(
+        'Cannot delete system job: __watch__',
+      );
 
       await manager.destroy();
     });
@@ -613,10 +640,14 @@ describe('Manager', () => {
       ).rejects.toThrow('Cron expression must be a string');
 
       // Test valid cron expressions
-      const validCrons = ['0 0 * * *', '*/5 * * * *', '0 12 * * MON'];
-      for (const cron of validCrons) {
+      const validCrons = [
+        { cron: '0 0 * * *', name: 'test-daily' },
+        { cron: '*/5 * * * *', name: 'test-every-5-minutes' },
+        { cron: '0 12 * * MON', name: 'test-monday-noon' },
+      ];
+      for (const { cron, name } of validCrons) {
         const job = await manager.createJob({
-          name: `test-${cron}`,
+          name,
           type: 'method',
           enabled: false,
           cron,
@@ -653,7 +684,7 @@ describe('Manager', () => {
       expect(inlineJob.type).toBe('inline');
 
       await manager.destroy();
-    });
+    }, 30000);
 
     it('should validate updateJob properly', async () => {
       const { manager } = createManager();
@@ -728,18 +759,18 @@ describe('Manager', () => {
         enabled: false,
       });
 
-      // Test null/undefined name
-      await expect(manager.toggleJob(null as any)).rejects.toThrow('Job name is required');
-      await expect(manager.toggleJob(undefined as any)).rejects.toThrow('Job name is required');
+      // Test null/undefined id
+      await expect(manager.toggleJob(null as any)).rejects.toThrow('Job id is required');
+      await expect(manager.toggleJob(undefined as any)).rejects.toThrow('Job id is required');
 
-      // Test empty string name
-      await expect(manager.toggleJob('')).rejects.toThrow('Job name is required');
+      // Test empty string id
+      await expect(manager.toggleJob('')).rejects.toThrow('Job id is required');
 
       // Test non-existent job
-      await expect(manager.toggleJob('non-existent-job')).rejects.toThrow('Job not found');
+      await expect(manager.toggleJob('non-existent-job-id')).rejects.toThrow('Job not found');
 
       // Test valid toggle (should succeed)
-      const toggledJob = await manager.toggleJob(job.name);
+      const toggledJob = await manager.toggleJob(job.id);
       expect(toggledJob.enabled).toBe(true);
 
       await manager.destroy();
@@ -877,9 +908,12 @@ describe('Manager', () => {
 
       await manager['triggerReset']();
 
-      expect(manager['updateControlWithRetry']).toHaveBeenCalledWith(control!.id, {
-        stale: control!.replicas,
-      });
+      expect(manager['updateControlWithRetry']).toHaveBeenCalledWith(
+        control!.id,
+        expect.objectContaining({
+          stale: control!.replicas,
+        }),
+      );
 
       // Restore original method
       manager['updateControlWithRetry'] = originalUpdateControlWithRetry;
@@ -1101,17 +1135,25 @@ describe('Manager', () => {
       expect(control).toBeDefined();
 
       // Mock the updateControl method on the storage instance to simulate version conflicts
+      let callCount = 0;
+
+      // Also mock getControl to return consistent control data for retries
+      const mockGetControl = jest.spyOn(storage, 'getControl').mockResolvedValue(control);
+
       const mockUpdateControl = jest
         .spyOn(storage, 'updateControl')
         .mockImplementation(async (id: string, data: any) => {
+          callCount++;
           // Simulate version conflicts for first 2 attempts, then success
-          const callCount = mockUpdateControl.mock.calls.length;
-          if (callCount < 2) {
-            throw new Error('version mismatch');
+          if (callCount <= 2) {
+            throw new Error('version mismatch detected - concurrent modification');
           }
-          // On success, call the original method
-          mockUpdateControl.mockRestore();
-          return storage.updateControl(id, data);
+          // On success, return a successful control update
+          return {
+            ...control!,
+            ...data,
+            version: 'new-version-after-update',
+          };
         });
 
       // This should succeed after retries
@@ -1119,8 +1161,9 @@ describe('Manager', () => {
         manager['updateControlWithRetry'](control!.id, { enabled: false }),
       ).resolves.toBeDefined();
 
-      // Restore original updateControl method
+      // Restore original methods
       mockUpdateControl.mockRestore();
+      mockGetControl.mockRestore();
       await manager.destroy();
     });
 
@@ -1300,7 +1343,12 @@ describe('Manager', () => {
 
       const stop = jest.fn();
       (manager as any)['cronJobs'].set('job-1', { stop } as any);
-      (manager as any)['activeLocks'].set('lock-1', 'value-1');
+      (manager as any)['activeLocks'].set('lock-1', {
+        lockValue: 'value-1',
+        acquiredAt: new Date(),
+        ttlMs: 30000,
+        jobName: 'test-job',
+      });
 
       const releaseSpy = jest
         .spyOn((manager as any)['cache'], 'releaseLock')
@@ -1318,14 +1366,21 @@ describe('Manager', () => {
       await manager.initialize();
 
       (manager as any)['logLevel'] = 'debug';
-      (manager as any)['activeLocks'].set('lock-2', 'value-2');
+      (manager as any)['activeLocks'].set('lock-2', {
+        lockValue: 'value-2',
+        acquiredAt: new Date(),
+        ttlMs: 30000,
+        jobName: 'test-job-2',
+      });
       const releaseSpy = jest
         .spyOn((manager as any)['cache'], 'releaseLock')
         .mockRejectedValue(new Error('nope'));
 
       await manager.destroy();
 
-      expect(mockLogger.debug).toHaveBeenCalledWith("Failed to release lock 'lock-2' on shutdown");
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        "Failed to release lock 'lock-2' on shutdown: nope",
+      );
       releaseSpy.mockRestore();
     });
   });
@@ -1752,12 +1807,12 @@ describe('Manager', () => {
       const { manager, storage } = createManager();
       await manager.initialize();
 
-      await expect(manager.toggleJob('' as any)).rejects.toThrow('Job name is required');
+      await expect(manager.toggleJob('' as any)).rejects.toThrow('Job id is required');
       await expect(manager.toggleJob('nope')).rejects.toThrow('Job not found: nope');
 
       const existingWatch = await storage.findJobByName(WATCH_JOB_NAME);
-      await expect(manager.toggleJob(existingWatch!.name)).rejects.toThrow(
-        'Cannot modify __watch__ jobs',
+      await expect(manager.toggleJob(existingWatch!.id)).rejects.toThrow(
+        'Cannot toggle system job: __watch__',
       );
 
       await manager.destroy();

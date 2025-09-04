@@ -94,7 +94,20 @@ import { BaseJobHandler, Bind } from '@crudmates/ludari';
 @Bind()
 class UserJobs extends BaseJobHandler {
   async recalcStats(context: { userId: string }) {
+    // This method can be called as a job
+    const data = await this._fetchUserData(context.userId);
     // ... your logic
+  }
+
+  // Private helper methods - excluded from job execution
+  private async _fetchUserData(userId: string) {
+    // This method cannot be called as a job (starts with underscore)
+    return { userId, stats: {} };
+  }
+
+  private async internalCleanup() {
+    // This method cannot be called as a job (starts with 'internal')
+    // ... cleanup logic
   }
 }
 
@@ -110,6 +123,12 @@ await manager.createJob({
   context: { userId: '123', distributed: true, ttl: 30 },
 });
 ```
+
+**Method Security**: Only public methods are callable as jobs. Private methods are automatically excluded if they:
+- Start with underscore (`_methodName`)
+- Start with common private prefixes (`internal*`, `private*`, `hidden*`)
+- End with common private suffixes (`*Private`, `*Internal`)
+- Are getters/setters or forbidden system methods
 
 #### Query Jobs
 

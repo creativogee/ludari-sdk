@@ -1,7 +1,6 @@
 /* istanbul ignore file */
 import { CronJob } from 'cron';
-import { randomUUID } from 'crypto';
-import * as crypto from 'crypto-js';
+import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes, randomUUID } from 'crypto';
 import { InMemoryCache } from '../implementations/in-memory-cache';
 import { Cache } from '../interfaces/cache.interface';
 import { Handler } from '../interfaces/job-handler.interface';
@@ -113,6 +112,130 @@ export class Manager {
     if (!this.logger) {
       throw new Error('logger is required');
     }
+
+    // Validate query secret strength if provided
+    if (this.querySecret) {
+      this.validateQuerySecret(this.querySecret);
+    }
+
+    // Validate replica ID
+    this.validateReplicaId(this.replicaId);
+  }
+
+  /**
+   * Validate query secret meets security requirements
+   */
+  private validateQuerySecret(secret: string): void {
+    if (typeof secret !== 'string') {
+      throw new Error('Query secret must be a string');
+    }
+
+    if (secret.length < 32) {
+      throw new Error('Query secret must be at least 32 characters long for adequate security');
+    }
+
+    // Check for minimum complexity
+    const hasLowerCase = /[a-z]/.test(secret);
+    const hasUpperCase = /[A-Z]/.test(secret);
+    const hasNumbers = /\d/.test(secret);
+    const hasSpecialChars = /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(secret);
+
+    const complexityScore = [hasLowerCase, hasUpperCase, hasNumbers, hasSpecialChars].filter(
+      Boolean,
+    ).length;
+
+    if (complexityScore < 3) {
+      throw new Error(
+        'Query secret must contain at least 3 of: lowercase, uppercase, numbers, special characters',
+      );
+    }
+
+    // Check for common weak patterns
+    const weakPatterns = [
+      /(.)\1{3,}/, // Repeated characters (aaaa, 1111, etc.)
+      /123456/, // Sequential numbers
+      /abcdef/i, // Sequential letters
+      /password/i, // Common words
+      /secret/i,
+      /admin/i,
+      /qwerty/i,
+    ];
+
+    for (const pattern of weakPatterns) {
+      if (pattern.test(secret)) {
+        throw new Error('Query secret contains weak patterns. Please use a stronger secret.');
+      }
+    }
+
+    this.log.debug('Query secret validation passed');
+  }
+
+  /**
+   * Validate replica ID format and security
+   */
+  private validateReplicaId(replicaId: string): void {
+    if (typeof replicaId !== 'string') {
+      throw new Error('Replica ID must be a string');
+    }
+
+    if (replicaId.length < 8) {
+      throw new Error('Replica ID must be at least 8 characters long');
+    }
+
+    // Check for UUID format (preferred) or other secure formats
+    const uuidPattern =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const securePattern = /^[a-zA-Z0-9_-]{8,}$/; // Alphanumeric with hyphens/underscores
+
+    if (!uuidPattern.test(replicaId) && !securePattern.test(replicaId)) {
+      throw new Error(
+        'Replica ID must be a UUID or contain only alphanumeric characters, hyphens, and underscores',
+      );
+    }
+
+    // Warn about using environment variable defaults in production
+    if (replicaId === process.env.LUDARI_REPLICA_ID && process.env.NODE_ENV === 'production') {
+      this.log.warn(
+        'Using environment variable LUDARI_REPLICA_ID in production. Ensure it is properly secured.',
+      );
+    }
+
+    this.log.debug(`Replica ID validation passed: ${replicaId}`);
+  }
+
+  /**
+   * Validate job access to prevent unauthorized operations on system jobs
+   */
+  private validateJobAccess(jobName: string, operation: string): void {
+    if (!jobName || typeof jobName !== 'string') {
+      throw new Error('Job name must be a non-empty string');
+    }
+
+    // System jobs are protected and cannot be modified directly
+    const systemJobs = [WATCH_JOB_NAME];
+    const protectedPrefixes = ['__', 'system:', 'internal:'];
+
+    if (systemJobs.includes(jobName)) {
+      throw new Error(`Cannot ${operation} system job: ${jobName}`);
+    }
+
+    // Check for protected prefixes
+    for (const prefix of protectedPrefixes) {
+      if (jobName.startsWith(prefix)) {
+        throw new Error(`Cannot ${operation} job with protected prefix '${prefix}': ${jobName}`);
+      }
+    }
+
+    // Validate job name format for security
+    if (!/^[a-zA-Z0-9_-]+$/.test(jobName)) {
+      throw new Error(
+        `Job name '${jobName}' contains invalid characters. Only alphanumeric, hyphens, and underscores are allowed.`,
+      );
+    }
+
+    if (jobName.length > 100) {
+      throw new Error('Job name cannot exceed 100 characters');
+    }
   }
 
   /**
@@ -125,6 +248,10 @@ export class Manager {
 
     try {
       await this.prepare();
+
+      // Start deadlock detection mechanism
+      this.startDeadlockDetection();
+
       this.isInitialized = true;
       this.log.info(`Manager initialized with replicaId: ${this.replicaId}`);
     } catch (error) {
@@ -302,7 +429,8 @@ export class Manager {
 
           execution = async () => {
             const decryptedQuery = this.decryptQuery(job.query!);
-            return await this.storage.executeQuery!(decryptedQuery);
+            const validatedQuery = this.validateAndSanitizeQuery(decryptedQuery);
+            return await this.storage.executeQuery!(validatedQuery);
           };
           break;
 
@@ -453,9 +581,14 @@ export class Manager {
         }
 
         lockValue = lockResult.lockValue;
-        // Track active lock for cleanup on shutdown
+        // Track active lock for cleanup on shutdown with metadata
         if (lockValue) {
-          this.activeLocks.set(lockKey, lockValue);
+          this.activeLocks.set(lockKey, {
+            lockValue,
+            acquiredAt: new Date(),
+            ttlMs: ttl,
+            jobName: name,
+          });
         }
         if (!job.silent) {
           this.log.info(`Job started: ${name}`);
@@ -498,10 +631,21 @@ export class Manager {
 
       this.log.warn(`Job failed: ${name} - ${errorObj.message}`);
     } finally {
-      // Release lock
+      // Release lock with error handling
       if (lockValue) {
-        await this.cache.releaseLock(lockKey, lockValue);
-        this.activeLocks.delete(lockKey);
+        try {
+          await this.cache.releaseLock(lockKey, lockValue);
+          this.activeLocks.delete(lockKey);
+          this.log.debug(`Lock released successfully: ${lockKey}`);
+        } catch (releaseError) {
+          this.log.warn(
+            `Failed to release lock ${lockKey}: ${
+              releaseError instanceof Error ? releaseError.message : String(releaseError)
+            }`,
+          );
+          // Still remove from tracking to prevent accumulation
+          this.activeLocks.delete(lockKey);
+        }
       }
     }
   }
@@ -513,6 +657,9 @@ export class Manager {
     this.ensureInitialized();
 
     this.validateJobData(data);
+
+    // Prevent creation of system jobs
+    this.validateJobAccess(data.name, 'create');
 
     // Encrypt query if provided
     if (data.query && this.querySecret) {
@@ -537,11 +684,16 @@ export class Manager {
     this.ensureInitialized();
 
     const existingJob = await this.storage.findJob(id);
-    if (existingJob && this.isWatchJob(existingJob)) {
-      throw new Error('Cannot modify __watch__ jobs');
-    }
 
     this.validateJobData(data, true);
+
+    if (existingJob) {
+      this.validateJobAccess(existingJob.name, 'update');
+    }
+
+    if (data.name) {
+      this.validateJobAccess(data.name, 'update');
+    }
 
     // Encrypt query if provided
     if (data.query && this.querySecret) {
@@ -570,22 +722,19 @@ export class Manager {
   /**
    * Toggle job enabled/disabled state
    */
-  async toggleJob(name: string): Promise<Job> {
+  async toggleJob(id: string): Promise<Job> {
     this.ensureInitialized();
 
-    if (!name) {
-      throw new Error('Job name is required');
+    if (!id) {
+      throw new Error('Job id is required');
     }
 
-    const job = await this.storage.findJobByName(name);
+    const job = await this.storage.findJob(id);
     if (!job) {
-      throw new Error(`Job not found: ${name}`);
+      throw new Error(`Job not found: ${id}`);
     }
 
-    // Prevent operations on __watch__ jobs
-    if (this.isWatchJob(job)) {
-      throw new Error('Cannot modify __watch__ jobs');
-    }
+    this.validateJobAccess(job.name, 'toggle');
 
     return this.updateJob(job.id, { enabled: !job.enabled });
   }
@@ -605,10 +754,7 @@ export class Manager {
       throw new Error(`Job not found: ${id}`);
     }
 
-    // Prevent operations on __watch__ jobs
-    if (this.isWatchJob(job)) {
-      throw new Error('Cannot modify __watch__ jobs');
-    }
+    this.validateJobAccess(job.name, 'enable');
 
     if (job.enabled) {
       return job; // Already enabled, return as-is
@@ -632,10 +778,7 @@ export class Manager {
       throw new Error(`Job not found: ${id}`);
     }
 
-    // Prevent operations on __watch__ jobs
-    if (this.isWatchJob(job)) {
-      throw new Error('Cannot modify __watch__ jobs');
-    }
+    this.validateJobAccess(job.name, 'disable');
 
     if (!job.enabled) {
       return job; // Already disabled, return as-is
@@ -677,10 +820,7 @@ export class Manager {
       throw new Error(`Job not found: ${id}`);
     }
 
-    // Prevent operations on __watch__ jobs
-    if (this.isWatchJob(job)) {
-      throw new Error('Cannot delete __watch__ jobs');
-    }
+    this.validateJobAccess(job.name, 'delete');
 
     // Stop the job if it's running
     const cronJob = this.cronJobs.get(job.name);
@@ -765,16 +905,31 @@ export class Manager {
     });
     this.cronJobs.clear();
 
+    // Stop deadlock detection
+    if (this.deadlockDetectionInterval) {
+      clearInterval(this.deadlockDetectionInterval);
+      this.deadlockDetectionInterval = undefined;
+    }
+
     // Release locks if configured
     if (this.releaseLocksOnShutdown) {
-      for (const [key, value] of this.activeLocks.entries()) {
+      const lockCount = this.activeLocks.size;
+      this.log.info(`Releasing ${lockCount} active locks on shutdown`);
+
+      for (const [key, lockInfo] of this.activeLocks.entries()) {
         try {
-          await this.cache.releaseLock(key, value);
+          await this.cache.releaseLock(key, lockInfo.lockValue);
+          this.log.debug(`Released lock '${key}' for job '${lockInfo.jobName}'`);
         } catch (err) {
-          this.log.debug(`Failed to release lock '${key}' on shutdown`);
+          this.log.warn(
+            `Failed to release lock '${key}' on shutdown: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
         }
       }
       this.activeLocks.clear();
+      this.log.info('All locks released on shutdown');
     }
 
     // Clear inline handlers to avoid retaining references after shutdown
@@ -834,7 +989,12 @@ export class Manager {
         new CronJob(data.cron, () => {
           // No-op function for validation only
         });
-      } catch {
+      } catch (cronError) {
+        this.log.warn(
+          `Cron validation failed for '${data.cron}': ${
+            cronError instanceof Error ? cronError.message : String(cronError)
+          }`,
+        );
         throw new Error(`Invalid cron expression: ${data.cron}`);
       }
     }
@@ -867,58 +1027,111 @@ export class Manager {
   private async updateControlWithRetry(
     id: string,
     data: UpdateControl,
-    maxRetries: number = 3,
+    maxRetries: number = 5,
   ): Promise<Control> {
+    let lastError: Error | null = null;
+
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const control = await this.storage.getControl();
-        if (!control) {
+        // Get fresh control data for each attempt
+        const currentControl = await this.storage.getControl();
+        if (!currentControl) {
           throw new Error('Control not found');
         }
 
-        return await this.storage.updateControl(id, {
-          ...data,
-          version: control.version, // Use current version
-        });
-      } catch (error) {
-        if (
-          error instanceof Error &&
-          error.message.includes('version mismatch') &&
-          attempt < maxRetries
-        ) {
-          // Version conflict - wait with exponential backoff before retry
-          const delay = Math.pow(2, attempt) * 100; // 200ms, 400ms, 800ms
-          this.log.debug(
-            `Control version conflict, retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`,
-          );
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          continue;
+        // Validate that we're updating the correct control record
+        if (currentControl.id !== id) {
+          throw new Error(`Control ID mismatch: expected ${id}, got ${currentControl.id}`);
         }
-        throw error;
+
+        // Merge data with current control state to handle concurrent updates
+        const mergedData: UpdateControl = {
+          ...data,
+          version: randomUUID(), // Always generate new version for atomic updates
+        };
+
+        // Special handling for array operations to prevent race conditions
+        if (data.replicas !== undefined) {
+          // Merge replica lists to prevent losing concurrent additions
+          const currentReplicas = new Set(currentControl.replicas);
+          const newReplicas = new Set(data.replicas);
+          mergedData.replicas = Array.from(new Set([...currentReplicas, ...newReplicas]));
+        }
+
+        if (data.stale !== undefined) {
+          // For stale list, use exact replacement but validate against current state
+          mergedData.stale = data.stale;
+        }
+
+        return await this.storage.updateControl(id, mergedData);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (
+          lastError.message.includes('version mismatch') ||
+          lastError.message.includes('optimistic lock') ||
+          lastError.message.includes('concurrent modification')
+        ) {
+          if (attempt < maxRetries) {
+            // Exponential backoff with jitter to reduce thundering herd
+            const baseDelay = Math.pow(2, attempt) * 100; // 200ms, 400ms, 800ms, 1600ms, 3200ms
+            const jitter = Math.random() * 0.1 * baseDelay; // Add up to 10% jitter
+            const delay = Math.floor(baseDelay + jitter);
+
+            this.log.debug(
+              `Control update conflict on attempt ${attempt}/${maxRetries}, retrying in ${delay}ms: ${lastError.message}`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            continue;
+          }
+        }
+
+        // For non-retryable errors, throw immediately
+        if (
+          !lastError.message.includes('version mismatch') &&
+          !lastError.message.includes('optimistic lock') &&
+          !lastError.message.includes('concurrent modification')
+        ) {
+          throw lastError;
+        }
       }
     }
 
-    throw new Error(`Failed to update control after ${maxRetries} attempts`);
+    throw new Error(
+      `Failed to update control after ${maxRetries} attempts. Last error: ${
+        lastError?.message || 'Unknown error'
+      }`,
+    );
   }
 
   private async triggerReset(): Promise<void> {
     try {
       const control = await this.storage.getControl();
-      if (control) {
-        // Use the retry helper to handle version conflicts gracefully
-        await this.updateControlWithRetry(control.id, {
-          stale: control.replicas,
-        });
+      if (!control) {
+        this.log.warn('Control not found during reset trigger');
+        return;
       }
+
+      // Create atomic update that marks all current replicas as stale
+      await this.updateControlWithRetry(control.id, {
+        stale: [...control.replicas], // Make a copy to avoid reference issues
+        version: randomUUID(), // Force new version
+      });
+
+      this.log.debug(`Reset triggered for ${control.replicas.length} replicas`);
     } catch (error) {
-      if (error instanceof Error && error.message.includes('version mismatch')) {
-        // Version conflict - another replica updated it, which is fine
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      if (
+        errorMessage.includes('version mismatch') ||
+        errorMessage.includes('optimistic lock') ||
+        errorMessage.includes('concurrent modification')
+      ) {
+        // Concurrent modification is acceptable during reset - another replica may have triggered it
         this.log.debug('Control updated by another replica during reset trigger');
       } else {
-        // Log but don't fail on version conflicts during reset
-        this.log.warn(
-          `Reset trigger failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        // Log but don't fail on other errors to maintain system stability
+        this.log.warn(`Reset trigger failed: ${errorMessage}`);
       }
     }
   }
@@ -927,15 +1140,125 @@ export class Manager {
     if (!this.querySecret) {
       throw new Error('Query secret not configured');
     }
-    return crypto.AES.encrypt(text, this.querySecret).toString();
+
+    // Generate a random IV for each encryption
+    const iv = randomBytes(16);
+
+    // Derive key using PBKDF2
+    const salt = randomBytes(32);
+    const key = pbkdf2Sync(this.querySecret, salt, 100000, 32, 'sha256');
+
+    // Use AES-256-CTR for compatibility
+    const cipher = createCipheriv('aes-256-ctr', key, iv);
+
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+
+    // Combine IV, salt, and encrypted data
+    const combined = Buffer.concat([iv, salt, Buffer.from(encrypted, 'hex')]);
+
+    return combined.toString('base64');
   }
 
-  private decryptQuery(text: string): string {
+  private decryptQuery(encryptedData: string): string {
     if (!this.querySecret) {
       throw new Error('Query secret not configured');
     }
-    const bytes = crypto.AES.decrypt(text, this.querySecret);
-    return bytes.toString(crypto.enc.Utf8);
+
+    try {
+      const combined = Buffer.from(encryptedData, 'base64');
+
+      // Extract components
+      const iv = combined.subarray(0, 16);
+      const salt = combined.subarray(16, 48);
+      const encrypted = combined.subarray(48);
+
+      // Derive key using PBKDF2
+      const key = pbkdf2Sync(this.querySecret, salt, 100000, 32, 'sha256');
+
+      // Use AES-256-CTR for compatibility
+      const decipher = createDecipheriv('aes-256-ctr', key, iv);
+
+      let decrypted = decipher.update(encrypted, undefined, 'utf8');
+      decrypted += decipher.final('utf8');
+
+      return decrypted;
+    } catch (error) {
+      throw new Error(
+        `Failed to decrypt query: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
+    }
+  }
+
+  private validateAndSanitizeQuery(query: string): string {
+    if (!query || typeof query !== 'string') {
+      throw new Error('Query must be a non-empty string');
+    }
+
+    // Remove comments and normalize whitespace
+    const sanitized = query
+      .replace(/--.*$/gm, '') // Remove SQL comments
+      .replace(/\/\*[\s\S]*?\*\//g, '') // Remove block comments
+      .replace(/\s+/g, ' ') // Normalize whitespace
+      .trim();
+
+    if (!sanitized) {
+      throw new Error('Query cannot be empty after sanitization');
+    }
+
+    // Define allowed SQL operations for job queries
+    const allowedOperations = [
+      'SELECT',
+      'INSERT',
+      'UPDATE',
+      'DELETE',
+      'WITH',
+      'CALL',
+      'EXEC',
+      'EXECUTE',
+    ];
+
+    // Check if query starts with allowed operation
+    const firstToken = sanitized.toUpperCase().split(/\s+/)[0];
+    if (!allowedOperations.includes(firstToken)) {
+      throw new Error(
+        `SQL operation '${firstToken}' is not allowed. Allowed operations: ${allowedOperations.join(
+          ', ',
+        )}`,
+      );
+    }
+
+    // Prevent dangerous SQL patterns
+    const dangerousPatterns = [
+      /;\s*(DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE)\s+/i,
+      /UNION.*SELECT/i,
+      /;\s*--/,
+      /'\s*;\s*/,
+      /\b(xp_|sp_)/i, // SQL Server extended procedures
+      /INFORMATION_SCHEMA/i,
+      /pg_/i, // PostgreSQL system tables
+      /mysql\./i, // MySQL system database
+    ];
+
+    for (const pattern of dangerousPatterns) {
+      if (pattern.test(sanitized)) {
+        throw new Error(`Query contains potentially dangerous pattern: ${pattern.toString()}`);
+      }
+    }
+
+    // Validate query length to prevent extremely large queries
+    if (sanitized.length > 10000) {
+      throw new Error('Query exceeds maximum allowed length of 10000 characters');
+    }
+
+    // Log query execution for audit purposes
+    this.log.debug(
+      `Executing validated query: ${sanitized.substring(0, 100)}${
+        sanitized.length > 100 ? '...' : ''
+      }`,
+    );
+
+    return sanitized;
   }
 
   private serializeResult(result: any, lens: Lens): any {
@@ -984,6 +1307,100 @@ export class Manager {
     }
   }
 
+  /**
+   * Start deadlock detection mechanism
+   */
+  private startDeadlockDetection(): void {
+    // Run deadlock detection every 60 seconds
+    this.deadlockDetectionInterval = setInterval(() => {
+      this.detectAndHandleDeadlocks().catch((error) => {
+        this.log.warn(
+          `Deadlock detection failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }, 60000);
+    // Do not keep the process alive for background detection
+    if (typeof this.deadlockDetectionInterval.unref === 'function') {
+      this.deadlockDetectionInterval.unref();
+    }
+  }
+
+  /**
+   * Detect and handle potential deadlocks
+   */
+  private async detectAndHandleDeadlocks(): Promise<void> {
+    if (this.isDestroyed || this.activeLocks.size === 0) {
+      return;
+    }
+
+    const now = new Date();
+    const staleLocks: string[] = [];
+
+    // Check for locks that have exceeded their TTL by a significant margin
+    for (const [lockKey, lockInfo] of this.activeLocks.entries()) {
+      const lockAge = now.getTime() - lockInfo.acquiredAt.getTime();
+      const stalenessThreshold = lockInfo.ttlMs * 2; // Consider stale if 2x TTL has passed
+
+      if (lockAge > stalenessThreshold) {
+        staleLocks.push(lockKey);
+        this.log.warn(
+          `Detected potentially stale lock: ${lockKey} for job '${lockInfo.jobName}' ` +
+            `(age: ${Math.round(lockAge / 1000)}s, TTL: ${Math.round(lockInfo.ttlMs / 1000)}s)`,
+        );
+      }
+    }
+
+    // Attempt to clean up stale locks
+    for (const lockKey of staleLocks) {
+      const lockInfo = this.activeLocks.get(lockKey);
+      if (lockInfo) {
+        try {
+          // Try to release the stale lock
+          const released = await this.cache.releaseLock(lockKey, lockInfo.lockValue);
+          if (released) {
+            this.activeLocks.delete(lockKey);
+            this.log.info(`Successfully cleaned up stale lock: ${lockKey}`);
+          } else {
+            this.log.warn(`Failed to release stale lock (may already be expired): ${lockKey}`);
+            // Remove from tracking anyway since we can't release it
+            this.activeLocks.delete(lockKey);
+          }
+        } catch (error) {
+          this.log.warn(
+            `Error cleaning up stale lock ${lockKey}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          // Remove from tracking to prevent repeated attempts
+          this.activeLocks.delete(lockKey);
+        }
+      }
+    }
+
+    // Log active locks summary for monitoring
+    if (this.activeLocks.size > 0) {
+      const lockSummary = Array.from(this.activeLocks.entries())
+        .map(([key, info]) => {
+          const age = Math.round((now.getTime() - info.acquiredAt.getTime()) / 1000);
+          return `${info.jobName}:${age}s`;
+        })
+        .join(', ');
+
+      this.log.debug(`Active locks (${this.activeLocks.size}): ${lockSummary}`);
+    }
+  }
+
   // Track locks acquired by this manager instance for safe cleanup
-  private readonly activeLocks = new Map<string, string>();
+  private readonly activeLocks = new Map<
+    string,
+    {
+      lockValue: string;
+      acquiredAt: Date;
+      ttlMs: number;
+      jobName: string;
+    }
+  >();
+
+  // Deadlock detection interval
+  private deadlockDetectionInterval?: NodeJS.Timeout;
 }

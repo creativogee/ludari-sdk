@@ -55,10 +55,24 @@ export class InMemoryCache implements Cache {
     // Set up periodic cleanup only if not disabled
     if (!options.disableCleanup) {
       this.cleanupInterval = setInterval(() => {
-        this.performCleanup().catch(() => {
-          // Ignore cleanup errors
+        this.performCleanup().catch((error) => {
+          // Log cleanup errors instead of silently ignoring them
+          this.debug('Cleanup failed:', error);
+
+          // In case of persistent cleanup failures, attempt to recreate internal state
+          if (error instanceof Error && error.message.includes('destroyed')) {
+            // Cache was destroyed but interval wasn't cleared - clear it now
+            if (this.cleanupInterval) {
+              clearInterval(this.cleanupInterval);
+              this.cleanupInterval = undefined;
+            }
+          }
         });
       }, cleanupIntervalMs);
+      // Do not keep the process alive because of periodic cleanup
+      if (typeof this.cleanupInterval.unref === 'function') {
+        this.cleanupInterval.unref();
+      }
     }
   }
 
@@ -117,6 +131,9 @@ export class InMemoryCache implements Cache {
           this.locks.delete(key);
           this.debug(`Lock expired and removed: ${key}`);
         }, options.ttlMs);
+        if (typeof timeoutId.unref === 'function') {
+          timeoutId.unref();
+        }
 
         // Store the lock
         this.locks.set(key, {
@@ -183,6 +200,9 @@ export class InMemoryCache implements Cache {
           this.locks.delete(key);
           this.debug(`Extended lock expired and removed: ${key}`);
         }, ttlMs);
+        if (typeof timeoutId.unref === 'function') {
+          timeoutId.unref();
+        }
 
         // Update the lock
         this.locks.set(key, {
@@ -229,6 +249,9 @@ export class InMemoryCache implements Cache {
             this.contexts.delete(key);
             this.debug(`Job context expired and removed: ${jobName}`);
           }, ttlMs);
+          if (typeof timeoutId.unref === 'function') {
+            timeoutId.unref();
+          }
         }
 
         this.contexts.set(key, {
@@ -241,7 +264,8 @@ export class InMemoryCache implements Cache {
       });
     } catch (error) {
       this.debug(`Set job context error for ${jobName}:`, error);
-      // Fail silently as per interface contract
+      // Log error but don't throw to maintain interface contract
+      // Consider if this should be surfaced to monitoring systems
     }
   }
 
@@ -289,7 +313,8 @@ export class InMemoryCache implements Cache {
       });
     } catch (error) {
       this.debug(`Delete job context error for ${jobName}:`, error);
-      // Fail silently as per interface contract
+      // Log error but don't throw to maintain interface contract
+      // Consider if this should be surfaced to monitoring systems
     }
   }
 
@@ -331,7 +356,8 @@ export class InMemoryCache implements Cache {
       });
     } catch (error) {
       this.debug(`Reset batch error for ${jobName}:`, error);
-      // Fail silently as per interface contract
+      // Log error but don't throw to maintain interface contract
+      // Consider if this should be surfaced to monitoring systems
     }
   }
 
@@ -362,7 +388,8 @@ export class InMemoryCache implements Cache {
       await this.performCleanup();
     } catch (error) {
       this.debug('Cleanup error:', error);
-      // Fail silently as per interface contract
+      // Log error but don't throw to maintain interface contract
+      // Consider if this should be surfaced to monitoring systems
     }
   }
 
@@ -405,25 +432,48 @@ export class InMemoryCache implements Cache {
    * Destroy the cache and clean up resources
    */
   async destroy(): Promise<void> {
+    if (this.isDestroyed) {
+      return; // Already destroyed, prevent double cleanup
+    }
+
     this.isDestroyed = true;
 
-    // Clear cleanup interval first
+    // Clear cleanup interval first to prevent new cleanup operations
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = undefined;
     }
 
-    // Clear all timeouts and data directly (without using withLock)
+    // Wait for any pending operations to complete
+    try {
+      await this.lockPromise;
+    } catch (error) {
+      this.debug('Error waiting for pending operations during destroy:', error);
+    }
+
+    // Clear all timeouts and data directly (without using withLock since we're destroyed)
+    let clearedTimers = 0;
+
     // Clear lock timeouts
     for (const lock of this.locks.values()) {
-      clearTimeout(lock.timeoutId);
+      try {
+        clearTimeout(lock.timeoutId);
+        clearedTimers++;
+      } catch (error) {
+        this.debug('Error clearing lock timeout:', error);
+      }
     }
     this.locks.clear();
 
     // Clear context timeouts
     for (const context of this.contexts.values()) {
       if (context.timeoutId) {
-        clearTimeout(context.timeoutId);
+        try {
+          clearTimeout(context.timeoutId);
+          clearedTimers++;
+        } catch (error) {
+          this.debug('Error clearing context timeout:', error);
+        }
       }
     }
     this.contexts.clear();
@@ -431,12 +481,16 @@ export class InMemoryCache implements Cache {
     // Clear batches
     this.batches.clear();
 
+    this.debug(`Cache destroyed - cleared ${clearedTimers} timers`);
+
     // Force cleanup of any remaining Node.js timers
     if (typeof global !== 'undefined' && global.gc) {
-      global.gc();
+      try {
+        global.gc();
+      } catch (error) {
+        this.debug('Error forcing garbage collection:', error);
+      }
     }
-
-    this.debug('Cache destroyed');
   }
 
   /**

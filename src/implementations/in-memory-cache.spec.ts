@@ -5,6 +5,58 @@ describe('InMemoryCache', () => {
   let cache: InMemoryCache;
 
   describe('additional branch coverage', () => {
+    it('timeouts created for locks and contexts are unrefed', async () => {
+      const originalSetTimeout = global.setTimeout;
+      let lastTimeout: any = null;
+      // Wrap setTimeout to capture the returned handle
+      (global as any).setTimeout = ((handler: any, timeout?: any, ...args: any[]) => {
+        const handle: any = originalSetTimeout(handler as any, timeout as any, ...args);
+        lastTimeout = handle;
+        return handle;
+      }) as any;
+
+      const cache = new InMemoryCache({ disableCleanup: true, debug: true });
+      try {
+        // Acquire a lock which creates an expiry timeout
+        await cache.acquireLock('k-unref', { ttlMs: 20 });
+        expect(lastTimeout).toBeTruthy();
+        if (typeof lastTimeout.hasRef === 'function') {
+          expect(lastTimeout.hasRef()).toBe(false);
+        }
+
+        // Set a context with TTL which also creates a timeout
+        lastTimeout = null;
+        await cache.setJobContext('job-unref', { a: 1 }, 20);
+        expect(lastTimeout).toBeTruthy();
+        if (typeof lastTimeout.hasRef === 'function') {
+          expect(lastTimeout.hasRef()).toBe(false);
+        }
+      } finally {
+        (global as any).setTimeout = originalSetTimeout;
+        await cache.destroy();
+      }
+    });
+
+    it('cleanup interval is unrefed', async () => {
+      const originalSetInterval = global.setInterval;
+      let lastInterval: any = null;
+      (global as any).setInterval = ((handler: any, timeout?: any, ...args: any[]) => {
+        const handle: any = originalSetInterval(handler as any, timeout as any, ...args);
+        lastInterval = handle;
+        return handle;
+      }) as any;
+
+      const cache = new InMemoryCache({ cleanupIntervalMs: 10, debug: true });
+      try {
+        expect(lastInterval).toBeTruthy();
+        if (typeof lastInterval.hasRef === 'function') {
+          expect(lastInterval.hasRef()).toBe(false);
+        }
+      } finally {
+        (global as any).setInterval = originalSetInterval;
+        await cache.destroy();
+      }
+    });
     it('constructor interval catches performCleanup errors', async () => {
       const cache: any = new InMemoryCache({ cleanupIntervalMs: 10, debug: true });
       const spy = jest.spyOn(cache, 'performCleanup').mockRejectedValueOnce(new Error('tick'));
@@ -189,6 +241,29 @@ describe('InMemoryCache', () => {
       await cache.cleanup();
       expect(cache['locks'].size).toBe(0);
       expect(cache['contexts'].size).toBe(0);
+    });
+
+    it('handles cleanup interval edge case when cache is destroyed during cleanup', async () => {
+      const cache: any = new InMemoryCache({ 
+        disableCleanup: false, 
+        debug: true, 
+        cleanupIntervalMs: 50 // Short interval for testing
+      });
+      
+      // Mock performCleanup to return a rejected promise with 'destroyed' error 
+      const spy = jest.spyOn(cache, 'performCleanup').mockImplementation(() => {
+        const error = new Error('Cache has been destroyed during cleanup');
+        return Promise.reject(error);
+      });
+      
+      // Wait for the interval to trigger and handle the error
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      
+      // The cleanup interval should be cleared when the 'destroyed' error occurs
+      expect(cache.cleanupInterval).toBeUndefined();
+      
+      spy.mockRestore();
+      await cache.destroy();
     });
   });
   beforeEach(() => {
@@ -597,6 +672,94 @@ describe('InMemoryCache', () => {
       // Check if lock was acquired (should be false due to expiration)
       const stats = await cache.getStats();
       expect(stats.locks).toBe(0);
+    });
+  });
+
+  describe('error handling coverage', () => {
+    it('should handle destroy error when waiting for pending operations', async () => {
+      const cache: any = new InMemoryCache({ disableCleanup: true, debug: true });
+      
+      // Set up a lockPromise that will reject
+      cache.lockPromise = Promise.reject(new Error('Pending operation failed'));
+      
+      // destroy() should handle the error gracefully
+      await expect(cache.destroy()).resolves.toBeUndefined();
+    });
+
+    it('should handle errors when clearing lock timeouts during destroy', async () => {
+      const cache: any = new InMemoryCache({ disableCleanup: true, debug: true });
+      
+      // Mock clearTimeout to throw an error for a specific timeout
+      const originalClearTimeout = global.clearTimeout;
+      const mockTimeoutId = setTimeout(() => {}, 1000);
+      
+      global.clearTimeout = (id: any) => {
+        if (id === mockTimeoutId) {
+          throw new Error('clearTimeout failed');
+        }
+        return originalClearTimeout(id);
+      };
+      
+      // Add a lock with the problematic timeout
+      cache.locks.set('problematic-lock', {
+        value: 'test',
+        expiresAt: new Date(Date.now() + 1000),
+        timeoutId: mockTimeoutId
+      });
+      
+      // destroy() should handle the error gracefully
+      await expect(cache.destroy()).resolves.toBeUndefined();
+      
+      // Restore original clearTimeout
+      global.clearTimeout = originalClearTimeout;
+    });
+
+    it('should handle errors when clearing context timeouts during destroy', async () => {
+      const cache: any = new InMemoryCache({ disableCleanup: true, debug: true });
+      
+      // Mock clearTimeout to throw an error for a specific timeout
+      const originalClearTimeout = global.clearTimeout;
+      const mockTimeoutId = setTimeout(() => {}, 1000);
+      
+      global.clearTimeout = (id: any) => {
+        if (id === mockTimeoutId) {
+          throw new Error('clearTimeout failed');
+        }
+        return originalClearTimeout(id);
+      };
+      
+      // Add a context with the problematic timeout
+      cache.contexts.set('context:problematic-job', {
+        value: { test: 'data' },
+        expiresAt: new Date(Date.now() + 1000),
+        timeoutId: mockTimeoutId
+      });
+      
+      // destroy() should handle the error gracefully
+      await expect(cache.destroy()).resolves.toBeUndefined();
+      
+      // Restore original clearTimeout
+      global.clearTimeout = originalClearTimeout;
+    });
+
+    it('should handle garbage collection errors during destroy', async () => {
+      const cache: any = new InMemoryCache({ disableCleanup: true, debug: true });
+      
+      // Mock global.gc to throw an error
+      const originalGc = (global as any).gc;
+      (global as any).gc = () => {
+        throw new Error('GC failed');
+      };
+      
+      // destroy() should handle the error gracefully
+      await expect(cache.destroy()).resolves.toBeUndefined();
+      
+      // Restore original gc
+      if (originalGc) {
+        (global as any).gc = originalGc;
+      } else {
+        delete (global as any).gc;
+      }
     });
   });
 });

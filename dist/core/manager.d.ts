@@ -135,6 +135,15 @@ export declare class Manager {
         enabled: boolean;
     }>;
     /**
+     * Purge the control - clear all replicas and stale entries
+     * This will clear all replicas and stale entries, effectively starting fresh
+     */
+    purgeControl(): Promise<{
+        success: boolean;
+        replicas: string[];
+        stale: string[];
+    }>;
+    /**
      * Destroy the manager and clean up resources
      */
     destroy(): Promise<void>;
@@ -165,4 +174,9 @@ export declare class Manager {
     private detectAndHandleDeadlocks;
     private readonly activeLocks;
     private deadlockDetectionInterval?;
+    /**
+     * Perform health check on existing replicas during initialization and return list of healthy ones
+     * Only runs during manager initialization to clean up definitively inactive replicas
+     */
+    private performReplicaHealthCheck;
 }

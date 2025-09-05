@@ -62,6 +62,10 @@ export declare class RedisCache implements Cache {
     getBatch(jobName: string): Promise<number>;
     resetBatch(jobName: string): Promise<void>;
     /**
+     * Replica health management
+     */
+    pingReplica(replicaId: string): Promise<boolean>;
+    /**
      * Health check and cleanup
      */
     isHealthy(): Promise<boolean>;

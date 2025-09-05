@@ -56,6 +56,7 @@ export interface UpdateControl {
   replicas?: string[];
   stale?: string[];
   version?: string;
+  _isHealthCheckUpdate?: boolean; // Internal flag for replica health check operations
 }
 
 export interface CreateJob {

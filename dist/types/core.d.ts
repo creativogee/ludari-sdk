@@ -45,6 +45,7 @@ export interface UpdateControl {
     replicas?: string[];
     stale?: string[];
     version?: string;
+    _isHealthCheckUpdate?: boolean;
 }
 export interface CreateJob {
     name: string;

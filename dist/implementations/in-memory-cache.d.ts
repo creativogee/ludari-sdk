@@ -59,6 +59,10 @@ export declare class InMemoryCache implements Cache {
      */
     private performCleanup;
     /**
+     * Replica health management
+     */
+    pingReplica(replicaId: string): Promise<boolean>;
+    /**
      * Destroy the cache and clean up resources
      */
     destroy(): Promise<void>;

@@ -1,0 +1,11 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "words": [
+    "retryable",
+    "pexpire",
+    "PEXPIRE"
+  ],
+  "allowCompoundWords": true,
+  "ignoreWords": []
+}

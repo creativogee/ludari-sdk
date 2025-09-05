@@ -125,4 +125,16 @@ export interface Cache {
      * @note Should not throw, log errors internally
      */
     destroy?(): Promise<void>;
+    /**
+     * Replica health management (optional)
+     * If not implemented, replica cleanup will be skipped
+     */
+    /**
+     * Check if a replica is healthy/responsive (optional)
+     * @param replicaId Replica identifier to check
+     * @returns true if replica responded within timeout, false otherwise
+     * @note Should not throw, return false on any error
+     * @note If not implemented, replica cleanup during initialization is disabled
+     */
+    pingReplica?(replicaId: string): Promise<boolean>;
 }

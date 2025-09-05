@@ -183,6 +183,25 @@ class RedisCache {
         }, undefined, 'resetBatch');
     }
     /**
+     * Replica health management
+     */
+    async pingReplica(replicaId) {
+        return this.safeOperation(async () => {
+            const replicaKey = this.key(`replica:${replicaId}`);
+            // Check if replica key exists and hasn't expired
+            const exists = await this.redis.exists(replicaKey);
+            if (exists === 1) {
+                // Also check TTL to make sure it's not about to expire
+                const ttl = await this.redis.ttl(replicaKey);
+                const isHealthy = ttl > 5; // Consider healthy if more than 5 seconds left
+                this.debug(`Ping ${isHealthy ? 'successful' : 'failed'}: replica ${replicaId} (TTL: ${ttl}s)`);
+                return isHealthy;
+            }
+            this.debug(`Ping failed: replica ${replicaId} not found`);
+            return false;
+        }, false, 'pingReplica');
+    }
+    /**
      * Health check and cleanup
      */
     async isHealthy() {

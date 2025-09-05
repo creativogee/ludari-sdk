@@ -354,6 +354,21 @@ class InMemoryCache {
         });
     }
     /**
+     * Replica health management
+     */
+    async pingReplica(replicaId) {
+        try {
+            // InMemoryCache doesn't track replicas without registerReplica
+            // Always return false to indicate "cannot determine health"
+            this.debug(`Ping failed: InMemoryCache doesn't track replicas (${replicaId})`);
+            return false;
+        }
+        catch (error) {
+            this.debug(`Ping replica error for ${replicaId}:`, error);
+            return false;
+        }
+    }
+    /**
      * Destroy the cache and clean up resources
      */
     async destroy() {

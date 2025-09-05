@@ -28,6 +28,7 @@ interface ContextData {
  * In-memory cache implementation with TTL support
  * Thread-safe with automatic cleanup of expired items
  */
+
 export class InMemoryCache implements Cache {
   private locks = new Map<string, LockData>();
   private contexts = new Map<string, ContextData>();
@@ -429,6 +430,23 @@ export class InMemoryCache implements Cache {
   }
 
   /**
+   * Replica health management
+   */
+
+  async pingReplica(replicaId: string): Promise<boolean> {
+    try {
+      // InMemoryCache doesn't track replicas without registerReplica
+      // Always return false to indicate "cannot determine health"
+      this.debug(`Ping failed: InMemoryCache doesn't track replicas (${replicaId})`);
+      return false;
+    } catch (error) {
+      this.debug(`Ping replica error for ${replicaId}:`, error);
+      return false;
+    }
+  }
+
+
+  /**
    * Destroy the cache and clean up resources
    */
   async destroy(): Promise<void> {
@@ -477,6 +495,7 @@ export class InMemoryCache implements Cache {
       }
     }
     this.contexts.clear();
+
 
     // Clear batches
     this.batches.clear();

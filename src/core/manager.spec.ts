@@ -351,6 +351,175 @@ describe('Manager', () => {
 
       await manager.destroy();
     });
+
+    it('should purge control successfully', async () => {
+      const { manager, storage } = createManager();
+      await manager.initialize();
+
+      // Get initial control state
+      const initialControl = await storage.getControl();
+      expect(initialControl!.replicas.length).toBeGreaterThan(0);
+
+      // Mock updateControlWithRetry to return the expected result
+      const originalUpdateControlWithRetry = manager['updateControlWithRetry'];
+      manager['updateControlWithRetry'] = jest.fn().mockResolvedValue({
+        ...initialControl,
+        replicas: [],
+        stale: [],
+      });
+
+      // Purge control
+      const result = await manager.purgeControl();
+      expect(result).toBeDefined();
+      expect(result.success).toBe(true);
+      expect(result.replicas).toEqual([]);
+      expect(result.stale).toEqual([]);
+
+      // Restore original method
+      manager['updateControlWithRetry'] = originalUpdateControlWithRetry;
+      await manager.destroy();
+    });
+
+    it('should purge control with existing stale entries', async () => {
+      const { manager, storage } = createManager();
+      await manager.initialize();
+
+      // Get initial control and add some stale replicas
+      const initialControl = await storage.getControl();
+      await storage.updateControl(initialControl!.id, {
+        replicas: [...initialControl!.replicas, 'replica-1', 'replica-2'],
+        stale: ['stale-replica-1', 'stale-replica-2'],
+      });
+
+      // Verify initial state
+      const beforeReset = await storage.getControl();
+      expect(beforeReset!.replicas.length).toBeGreaterThan(2);
+      expect(beforeReset!.stale.length).toBe(2);
+
+      // Mock updateControlWithRetry to return the expected result
+      const originalUpdateControlWithRetry = manager['updateControlWithRetry'];
+      manager['updateControlWithRetry'] = jest.fn().mockResolvedValue({
+        ...beforeReset,
+        replicas: [],
+        stale: [],
+      });
+
+      // Purge control
+      const result = await manager.purgeControl();
+      expect(result).toBeDefined();
+      expect(result.success).toBe(true);
+      expect(result.replicas).toEqual([]);
+      expect(result.stale).toEqual([]);
+
+      // Restore original method
+      manager['updateControlWithRetry'] = originalUpdateControlWithRetry;
+      await manager.destroy();
+    });
+
+    it('should throw error when control not found', async () => {
+      const { manager, storage } = createManager();
+      await manager.initialize();
+
+      // Mock getControl to return null
+      const spy = jest.spyOn(storage, 'getControl').mockResolvedValueOnce(null);
+
+      await expect(manager.purgeControl()).rejects.toThrow('Control not found');
+
+      spy.mockRestore();
+      await manager.destroy();
+    });
+
+    it('should handle version conflicts through updateControlWithRetry', async () => {
+      const { manager, storage } = createManager();
+      await manager.initialize();
+
+      // Get existing control
+      const control = await storage.getControl();
+      expect(control).toBeDefined();
+
+      // Mock the storage updateControl method to simulate version conflicts and then succeed
+      let callCount = 0;
+      const mockUpdateControl = jest
+        .spyOn(storage, 'updateControl')
+        .mockImplementation(async (id: string, data: any) => {
+          callCount++;
+          // Simulate version conflicts for first 2 attempts, then success
+          if (callCount <= 2) {
+            throw new Error('version mismatch detected - concurrent modification');
+          }
+          // On success, return a successful control update
+          return {
+            ...control!,
+            ...data,
+            version: 'new-version-after-update',
+          };
+        });
+
+      // Also mock getControl to return consistent control data for retries
+      const mockGetControl = jest.spyOn(storage, 'getControl').mockResolvedValue(control);
+
+      const result = await manager.purgeControl();
+      expect(result).toBeDefined();
+      expect(result.success).toBe(true);
+      expect(callCount).toBeGreaterThanOrEqual(2); // Should have retried at least once
+
+      // Restore original methods
+      mockUpdateControl.mockRestore();
+      mockGetControl.mockRestore();
+      await manager.destroy();
+    });
+
+    it('should propagate errors from updateControlWithRetry', async () => {
+      const { manager, storage } = createManager();
+      await manager.initialize();
+
+      // Get existing control
+      const control = await storage.getControl();
+      expect(control).toBeDefined();
+
+      // Mock the updateControlWithRetry method to always fail
+      const originalUpdateControlWithRetry = manager['updateControlWithRetry'];
+      manager['updateControlWithRetry'] = jest
+        .fn()
+        .mockRejectedValue(new Error('Storage error'));
+
+      await expect(manager.purgeControl()).rejects.toThrow('Storage error');
+
+      // Restore original method
+      manager['updateControlWithRetry'] = originalUpdateControlWithRetry;
+      await manager.destroy();
+    });
+
+    it('should log success message when reset completes', async () => {
+      const { manager } = createManager();
+      await manager.initialize();
+
+      const result = await manager.purgeControl();
+      expect(result).toBeDefined();
+      expect(result!.success).toBe(true);
+
+      expect(mockLogger.log).toHaveBeenCalledWith(
+        'Replica list reset - all replicas and stale entries cleared'
+      );
+
+      await manager.destroy();
+    });
+
+    it('should call prepare after successful reset', async () => {
+      const { manager } = createManager();
+      await manager.initialize();
+
+      // Spy on the prepare method
+      const prepareSpy = jest.spyOn(manager as any, 'prepare');
+
+      const result = await manager.purgeControl();
+      expect(result).toBeDefined();
+      expect(result!.success).toBe(true);
+      expect(prepareSpy).toHaveBeenCalled();
+
+      prepareSpy.mockRestore();
+      await manager.destroy();
+    });
   });
 
   describe('replica management', () => {
@@ -1923,6 +2092,154 @@ describe('Manager', () => {
       await manager['handleJob']('merge', exec as any);
       expect(exec).toHaveBeenCalled();
       setCtx.mockRestore();
+      await manager.destroy();
+    });
+  });
+
+  describe('replica health check and cleanup', () => {
+    it('should perform health check and remove inactive replicas during initialization', async () => {
+      const { manager, storage, cache } = createManager();
+      
+      // Create initial control
+      const initialControl = await storage.createControl({
+        enabled: true,
+        replicas: ['replica-1', 'replica-2', 'replica-3'],
+        stale: [],
+        version: 'test-version',
+      });
+
+      // Mock pingReplica to simulate some replicas being inactive
+      const mockPingReplica = jest.fn()
+        .mockImplementation(async (replicaId: string) => {
+          // replica-1 is active, replica-2 and replica-3 are inactive
+          return replicaId === 'replica-1';
+        });
+      
+      (cache as any).pingReplica = mockPingReplica;
+
+      // Initialize manager (should trigger health check)
+      await manager.initialize();
+
+      // Verify health check was called for each replica (except current one)
+      expect(mockPingReplica).toHaveBeenCalledWith('replica-1');
+      expect(mockPingReplica).toHaveBeenCalledWith('replica-2');
+      expect(mockPingReplica).toHaveBeenCalledWith('replica-3');
+      expect(mockPingReplica).not.toHaveBeenCalledWith(manager['replicaId']);
+
+      // Verify inactive replicas were removed
+      const updatedControl = await storage.getControl();
+      expect(updatedControl!.replicas).toContain('replica-1'); // healthy
+      expect(updatedControl!.replicas).toContain(manager['replicaId']); // current replica
+      expect(updatedControl!.replicas).not.toContain('replica-2'); // unhealthy
+      expect(updatedControl!.replicas).not.toContain('replica-3'); // unhealthy
+
+      // Verify log message about removed replicas
+      expect(mockLogger.log).toHaveBeenCalledWith(
+        expect.stringMatching(/Removed inactive replicas.*replica-2.*replica-3/)
+      );
+
+      await manager.destroy();
+    });
+
+    it('should handle cache without replica health check support', async () => {
+      const { manager, storage } = createManager();
+      
+      // Create initial control with multiple replicas (not including current replica)
+      const testReplicas = ['replica-1', 'replica-2'];
+      await storage.createControl({
+        enabled: true,
+        replicas: [...testReplicas, manager['replicaId']],
+        stale: [],
+        version: 'test-version',
+      });
+
+      // Remove pingReplica method to simulate unsupported cache
+      (manager['cache'] as any).pingReplica = undefined;
+      
+      (manager as any)['logLevel'] = 'debug';
+      await manager.initialize();
+
+      // Verify all replicas remain (no health check performed) plus current replica
+      const updatedControl = await storage.getControl();
+      expect(updatedControl!.replicas).toContain(testReplicas[0]);
+      expect(updatedControl!.replicas).toContain(testReplicas[1]);
+      expect(updatedControl!.replicas).toContain(manager['replicaId']);
+
+      expect(mockLogger.debug).toHaveBeenCalledWith(
+        'Cache does not support replica health checks, keeping all replicas'
+      );
+
+      await manager.destroy();
+    });
+
+    it('should register replica in cache and renew registration periodically', async () => {
+      const { manager, cache } = createManager();
+      
+      // Mock registerReplica method
+      const mockRegisterReplica = jest.fn().mockResolvedValue(undefined);
+      (cache as any).registerReplica = mockRegisterReplica;
+
+      await manager.initialize();
+
+      // Verify replica was registered during initialization
+      expect(mockRegisterReplica).toHaveBeenCalledWith(manager['replicaId'], 90000);
+
+      // Simulate watch job execution to test registration renewal
+      const watchJob = await manager['storage'].findJobByName('__watch__');
+      expect(watchJob).toBeDefined();
+
+      // Call executeJob directly to test watch job behavior
+      await manager['executeJob'](watchJob!);
+
+      // Verify replica registration was renewed
+      expect(mockRegisterReplica).toHaveBeenCalledTimes(2);
+      expect(mockRegisterReplica).toHaveBeenLastCalledWith(manager['replicaId'], 90000);
+
+      await manager.destroy();
+    });
+
+    it('should handle replica registration failures gracefully', async () => {
+      const { manager, cache } = createManager();
+      
+      // Mock registerReplica to throw error
+      const mockRegisterReplica = jest.fn().mockRejectedValue(new Error('Cache connection failed'));
+      (cache as any).registerReplica = mockRegisterReplica;
+
+      // Should not throw during initialization despite registration failure
+      // The registration failure is caught and logged, but doesn't prevent initialization
+      await expect(manager.initialize()).resolves.toBeUndefined();
+
+      await manager.destroy();
+    });
+
+    it('should clean stale entries for removed replicas', async () => {
+      const { manager, storage, cache } = createManager();
+      
+      const testReplicas = ['replica-1', 'replica-2', 'replica-3'];
+      await storage.createControl({
+        enabled: true,
+        replicas: testReplicas,
+        stale: ['replica-2', 'replica-3'], // Both are stale
+        version: 'test-version',
+      });
+
+      // Mock pingReplica - only replica-1 is healthy
+      const mockPingReplica = jest.fn()
+        .mockImplementation(async (replicaId: string) => replicaId === 'replica-1');
+      (cache as any).pingReplica = mockPingReplica;
+
+      await manager.initialize();
+
+      const updatedControl = await storage.getControl();
+      // Only replica-1 and current replica should remain
+      expect(updatedControl!.replicas).toContain('replica-1');
+      expect(updatedControl!.replicas).toContain(manager['replicaId']);
+      expect(updatedControl!.replicas).not.toContain('replica-2');
+      expect(updatedControl!.replicas).not.toContain('replica-3');
+      
+      // Stale list should be cleaned (replica-2 and replica-3 removed from stale)
+      expect(updatedControl!.stale).toEqual([]);
+
       await manager.destroy();
     });
   });

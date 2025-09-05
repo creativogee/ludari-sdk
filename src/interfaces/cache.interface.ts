@@ -143,4 +143,32 @@ export interface Cache {
    * @note Should not throw, log errors internally
    */
   destroy?(): Promise<void>
+
+  /**
+   * Replica health management
+   */
+  
+  /**
+   * Register replica as active with timestamp
+   * @param replicaId Unique replica identifier
+   * @param ttlMs How long the replica registration is valid (defaults to 60000ms)
+   * @note Should not throw, log errors internally
+   */
+  registerReplica(replicaId: string, ttlMs?: number): Promise<void>
+  
+  /**
+   * Check if a replica is healthy/responsive
+   * @param replicaId Replica identifier to check
+   * @returns true if replica responded within timeout, false otherwise
+   * @note Should not throw, return false on any error
+   */
+  pingReplica(replicaId: string): Promise<boolean>
+  
+  /**
+   * Get list of recently active replicas
+   * @param maxAgeMs Maximum age in milliseconds to consider active (defaults to 60000ms)
+   * @returns Array of active replica IDs
+   * @note Should not throw, return empty array on error
+   */
+  getActiveReplicas(maxAgeMs?: number): Promise<string[]>
 }

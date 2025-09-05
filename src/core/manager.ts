@@ -247,6 +247,22 @@ export class Manager {
     }
 
     try {
+      // Register this replica as active if cache supports it
+      // Do this BEFORE prepare() to ensure it's available for health checks
+      if (this.cache.registerReplica) {
+        try {
+          await this.cache.registerReplica(this.replicaId, 90000); // 90 seconds TTL
+          this.log.debug(`Replica registered in cache: ${this.replicaId}`);
+        } catch (error) {
+          this.log.warn(
+            `Failed to register replica in cache: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          // Don't fail initialization due to cache registration issues
+        }
+      }
+
       await this.prepare();
 
       // Start deadlock detection mechanism
@@ -279,14 +295,32 @@ export class Manager {
         });
       }
 
-      // Register this replica without marking self as stale
-      if (!control.replicas.includes(this.replicaId)) {
-        control.replicas.push(this.replicaId);
+      // Health check existing replicas and remove inactive ones
+      const healthyReplicas = await this.performReplicaHealthCheck(control.replicas);
 
-        await this.storage.updateControl(control.id, {
-          replicas: control.replicas,
-          stale: control.stale,
-          version: control.version, // Use current version instead of generating new one
+      // Register this replica if not already included
+      if (!healthyReplicas.includes(this.replicaId)) {
+        healthyReplicas.push(this.replicaId);
+      }
+
+      // Update control with cleaned replica list if it changed
+      const arraysEqual = (arr1: string[], arr2: string[]) =>
+        arr1.length === arr2.length &&
+        arr1.every((item) => arr2.includes(item)) &&
+        arr2.every((item) => arr1.includes(item));
+
+      if (!arraysEqual(healthyReplicas, control.replicas)) {
+        const removedReplicas = control.replicas.filter((r) => !healthyReplicas.includes(r));
+        if (removedReplicas.length > 0) {
+          this.log.info(`Removed inactive replicas: ${removedReplicas.join(', ')}`);
+        }
+
+        // Use retry logic to handle concurrent updates
+        // Mark this as a health check operation to use exact replacement logic
+        await this.updateControlWithRetry(control.id, {
+          replicas: healthyReplicas,
+          stale: control.stale.filter((r) => healthyReplicas.includes(r)), // Remove stale entries for inactive replicas
+          _isHealthCheckUpdate: true, // Special flag to indicate this should replace, not merge
         });
       }
 
@@ -407,8 +441,22 @@ export class Manager {
         await this.resetJobs(control);
       }
 
-      // Skip watch job execution
+      // Handle watch job execution
       if (job.name === WATCH_JOB_NAME) {
+        // Renew replica registration if cache supports it
+        if (this.cache.registerReplica) {
+          try {
+            await this.cache.registerReplica(this.replicaId, 90000); // 90 seconds TTL
+            this.log.debug(`Replica registration renewed: ${this.replicaId}`);
+          } catch (error) {
+            this.log.warn(
+              `Failed to renew replica registration: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            // Continue processing despite registration failure
+          }
+        }
         return;
       }
 
@@ -889,6 +937,36 @@ export class Manager {
   }
 
   /**
+   * Purge the control - clear all replicas and stale entries
+   * This will clear all replicas and stale entries, effectively starting fresh
+   */
+  async purgeControl(): Promise<{ success: boolean; replicas: string[]; stale: string[] }> {
+    this.ensureInitialized();
+
+    const control = await this.storage.getControl();
+
+    if (!control) {
+      throw new Error('Control not found');
+    }
+
+    // Reset both replicas and stale lists to empty arrays
+    const updatedControl = await this.updateControlWithRetry(control.id, {
+      replicas: [],
+      stale: [],
+    });
+
+    // Reinitialize the manager state after purging
+    await this.prepare();
+
+    this.log.info('Replica list reset - all replicas and stale entries cleared');
+    return {
+      success: true,
+      replicas: updatedControl.replicas,
+      stale: updatedControl.stale,
+    };
+  }
+
+  /**
    * Destroy the manager and clean up resources
    */
   async destroy(): Promise<void> {
@@ -1047,15 +1125,21 @@ export class Manager {
         // Merge data with current control state to handle concurrent updates
         const mergedData: UpdateControl = {
           ...data,
-          version: randomUUID(), // Always generate new version for atomic updates
+          version: currentControl.version, // Use current version for optimistic locking
         };
 
         // Special handling for array operations to prevent race conditions
         if (data.replicas !== undefined) {
-          // Merge replica lists to prevent losing concurrent additions
-          const currentReplicas = new Set(currentControl.replicas);
-          const newReplicas = new Set(data.replicas);
-          mergedData.replicas = Array.from(new Set([...currentReplicas, ...newReplicas]));
+          // For purgeControl (empty array) or health check updates, use exact replacement
+          if (data.replicas.length === 0 || (data as any)._isHealthCheckUpdate) {
+            mergedData.replicas = data.replicas;
+          } else {
+            // For replica additions, merge with current state to avoid losing
+            // replicas that were added concurrently by other instances
+            const currentReplicas = new Set(currentControl.replicas);
+            const newReplicas = new Set(data.replicas);
+            mergedData.replicas = Array.from(new Set([...currentReplicas, ...newReplicas]));
+          }
         }
 
         if (data.stale !== undefined) {
@@ -1380,7 +1464,7 @@ export class Manager {
     // Log active locks summary for monitoring
     if (this.activeLocks.size > 0) {
       const lockSummary = Array.from(this.activeLocks.entries())
-        .map(([key, info]) => {
+        .map(([, info]) => {
           const age = Math.round((now.getTime() - info.acquiredAt.getTime()) / 1000);
           return `${info.jobName}:${age}s`;
         })
@@ -1403,4 +1487,59 @@ export class Manager {
 
   // Deadlock detection interval
   private deadlockDetectionInterval?: NodeJS.Timeout;
+
+  /**
+   * Perform health check on existing replicas and return list of healthy ones
+   */
+  private async performReplicaHealthCheck(replicas: string[]): Promise<string[]> {
+    if (!replicas.length) {
+      return [];
+    }
+
+    const healthyReplicas: string[] = [];
+
+    // If cache doesn't support replica health checks, assume all are healthy
+    if (!this.cache.pingReplica) {
+      this.log.debug('Cache does not support replica health checks, keeping all replicas');
+      // Return all replicas as healthy
+      return [...replicas];
+    }
+
+    // Check each replica's health
+    const healthCheckPromises = replicas.map(async (replicaId) => {
+      try {
+        // Skip health check for current replica (always consider it healthy)
+        if (replicaId === this.replicaId) {
+          return { replicaId, isHealthy: true };
+        }
+
+        const isHealthy = await this.cache.pingReplica(replicaId);
+        return { replicaId, isHealthy };
+      } catch (error) {
+        this.log.warn(
+          `Health check failed for replica ${replicaId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return { replicaId, isHealthy: false };
+      }
+    });
+
+    // Wait for all health checks with a timeout
+    const healthCheckResults = await Promise.all(healthCheckPromises);
+
+    // Collect healthy replicas
+    for (const result of healthCheckResults) {
+      if (result.isHealthy) {
+        healthyReplicas.push(result.replicaId);
+      } else {
+        this.log.debug(`Replica ${result.replicaId} failed health check and will be removed`);
+      }
+    }
+
+    this.log.debug(
+      `Health check completed: ${healthyReplicas.length}/${replicas.length} replicas are healthy`,
+    );
+    return healthyReplicas;
+  }
 }

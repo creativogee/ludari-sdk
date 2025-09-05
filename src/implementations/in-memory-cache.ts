@@ -28,10 +28,20 @@ interface ContextData {
  * In-memory cache implementation with TTL support
  * Thread-safe with automatic cleanup of expired items
  */
+/**
+ * Internal replica data structure
+ */
+interface ReplicaData {
+  registeredAt: Date;
+  expiresAt?: Date;
+  timeoutId?: NodeJS.Timeout;
+}
+
 export class InMemoryCache implements Cache {
   private locks = new Map<string, LockData>();
   private contexts = new Map<string, ContextData>();
   private batches = new Map<string, number>();
+  private replicas = new Map<string, ReplicaData>();
 
   // Simple locking mechanism for thread safety
   private lockPromise: Promise<void> = Promise.resolve();
@@ -401,6 +411,7 @@ export class InMemoryCache implements Cache {
       const now = new Date();
       let cleanedLocks = 0;
       let cleanedContexts = 0;
+      let cleanedReplicas = 0;
 
       // Clean up expired locks
       for (const [key, lock] of this.locks.entries()) {
@@ -422,10 +433,122 @@ export class InMemoryCache implements Cache {
         }
       }
 
-      if (cleanedLocks > 0 || cleanedContexts > 0) {
-        this.debug(`Cleanup completed: ${cleanedLocks} locks, ${cleanedContexts} contexts`);
+      // Clean up expired replicas
+      for (const [replicaId, replica] of this.replicas.entries()) {
+        if (replica.expiresAt && replica.expiresAt <= now) {
+          if (replica.timeoutId) {
+            clearTimeout(replica.timeoutId);
+          }
+          this.replicas.delete(replicaId);
+          cleanedReplicas++;
+        }
+      }
+
+      if (cleanedLocks > 0 || cleanedContexts > 0 || cleanedReplicas > 0) {
+        this.debug(`Cleanup completed: ${cleanedLocks} locks, ${cleanedContexts} contexts, ${cleanedReplicas} replicas`);
       }
     });
+  }
+
+  /**
+   * Replica health management
+   */
+
+  async registerReplica(replicaId: string, ttlMs: number = 60000): Promise<void> {
+    try {
+      await this.withLock(() => {
+        // Clear existing timeout if any
+        const existing = this.replicas.get(replicaId);
+        if (existing?.timeoutId) {
+          clearTimeout(existing.timeoutId);
+        }
+
+        let timeoutId: NodeJS.Timeout | undefined;
+        let expiresAt: Date | undefined;
+
+        // Set up expiration
+        expiresAt = new Date(Date.now() + ttlMs);
+        timeoutId = setTimeout(() => {
+          this.replicas.delete(replicaId);
+          this.debug(`Replica registration expired and removed: ${replicaId}`);
+        }, ttlMs);
+        if (typeof timeoutId.unref === 'function') {
+          timeoutId.unref();
+        }
+
+        this.replicas.set(replicaId, {
+          registeredAt: new Date(),
+          expiresAt,
+          timeoutId,
+        });
+
+        this.debug(`Replica registered: ${replicaId}, expires at ${expiresAt.toISOString()}`);
+      });
+    } catch (error) {
+      this.debug(`Register replica error for ${replicaId}:`, error);
+    }
+  }
+
+  async pingReplica(replicaId: string): Promise<boolean> {
+    try {
+      return await this.withLock(() => {
+        const replica = this.replicas.get(replicaId);
+        
+        if (!replica) {
+          this.debug(`Ping failed: replica ${replicaId} not registered`);
+          return false;
+        }
+
+        // Check if expired
+        if (replica.expiresAt && replica.expiresAt <= new Date()) {
+          if (replica.timeoutId) {
+            clearTimeout(replica.timeoutId);
+          }
+          this.replicas.delete(replicaId);
+          this.debug(`Ping failed: replica ${replicaId} expired`);
+          return false;
+        }
+
+        this.debug(`Ping successful: replica ${replicaId} is active`);
+        return true;
+      });
+    } catch (error) {
+      this.debug(`Ping replica error for ${replicaId}:`, error);
+      return false;
+    }
+  }
+
+  async getActiveReplicas(maxAgeMs: number = 60000): Promise<string[]> {
+    try {
+      return await this.withLock(() => {
+        const now = new Date();
+        const cutoff = new Date(now.getTime() - maxAgeMs);
+        const activeReplicas: string[] = [];
+
+        for (const [replicaId, replica] of this.replicas.entries()) {
+          // Check if not expired and within max age
+          const isNotExpired = !replica.expiresAt || replica.expiresAt > now;
+          const isWithinMaxAge = replica.registeredAt >= cutoff;
+
+          if (isNotExpired && isWithinMaxAge) {
+            activeReplicas.push(replicaId);
+          } else if (!isNotExpired) {
+            // Clean up expired replica
+            if (replica.timeoutId) {
+              clearTimeout(replica.timeoutId);
+            }
+            this.replicas.delete(replicaId);
+            this.debug(`Removed expired replica during getActiveReplicas: ${replicaId}`);
+          }
+        }
+
+        this.debug(`Found ${activeReplicas.length} active replicas: ${activeReplicas.join(', ')}`);
+        return activeReplicas;
+      });
+    } catch (error) {
+      this.debug(`Get active replicas error:`, error);
+      return [];
+    }
   }
 
   /**
@@ -478,6 +601,19 @@ export class InMemoryCache implements Cache {
     }
     this.contexts.clear();
 
+    // Clear replica timeouts
+    for (const replica of this.replicas.values()) {
+      if (replica.timeoutId) {
+        try {
+          clearTimeout(replica.timeoutId);
+          clearedTimers++;
+        } catch (error) {
+          this.debug('Error clearing replica timeout:', error);
+        }
+      }
+    }
+    this.replicas.clear();
+
     // Clear batches
     this.batches.clear();
 
@@ -500,11 +636,13 @@ export class InMemoryCache implements Cache {
     locks: number;
     contexts: number;
     batches: number;
+    replicas: number;
   }> {
     return this.withLock(() => ({
       locks: this.locks.size,
       contexts: this.contexts.size,
       batches: this.batches.size,
+      replicas: this.replicas.size,
     }));
   }
 }
